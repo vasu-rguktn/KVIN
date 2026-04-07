@@ -121,8 +121,8 @@ st.markdown("""
     /* Divider */
     hr { border-color: #2a2d3a; }
 
-    /* Progress bar colour override */
-    .stProgress > div > div > div { background-color: #7eb6ff !important; }
+    /* Ensure plotly charts always stretch to full column width */
+    [data-testid="stPlotlyChart"] > div { width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -159,7 +159,10 @@ def gauge_chart(value: float, title: str, color: str) -> go.Figure:
         number = {"suffix": "%", "font": {"size": 28, "color": "#e0e0e0"}},
         title  = {"text": title, "font": {"size": 13, "color": "#8888aa"}},
         gauge  = {
-            "axis": {"range": [0, 100], "tickcolor": "#555", "tickfont": {"color": "#666"}},
+            "axis": {"range": [0, 100], "tickcolor": "#555", "tickfont": {"color": "#666"},
+                "nticks": 6,
+                "tickwidth": 1,
+            },
             "bar":  {"color": color, "thickness": 0.28},
             "bgcolor": "#22263a",
             "borderwidth": 0,
@@ -175,6 +178,7 @@ def gauge_chart(value: float, title: str, color: str) -> go.Figure:
         },
     ))
     fig.update_layout(
+        autosize= True,
         height=200,
         margin={"t": 40, "b": 10, "l": 20, "r": 20},
         paper_bgcolor="#1a1d27",
@@ -199,6 +203,7 @@ def bar_chart_parts(prob_dict: dict, predicted: str) -> go.Figure:
         textfont    = {"color": "#e0e0e0", "size": 12},
     ))
     fig.update_layout(
+        autosize      = True,
         height      = 180,
         margin      = {"t": 10, "b": 10, "l": 10, "r": 60},
         paper_bgcolor="#1a1d27",
@@ -208,6 +213,9 @@ def bar_chart_parts(prob_dict: dict, predicted: str) -> go.Figure:
         showlegend  = False,
     )
     return fig
+
+
+PLOTLY_CFG = {"displayModeBar": False, "responsive": True}
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -232,11 +240,12 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### About")
     st.markdown(
-        "Two-phase deep learning pipeline using **ResNet50**:\n\n"
-        "1. **Phase 1** – Identify body part  \n"
-        "   *(Elbow / Hand / Shoulder)*\n\n"
-        "2. **Phase 2** – Detect fracture  \n"
-        "   *(Fractured / Normal)*"
+        "Three-phase pipeline:\n\n"
+        "**Phase 0** – AI/real image check *(Gemini)*\n\n"
+        "**Phase 1** – Body part ID *(ResNet50)*\n"
+        "*(Elbow / Hand / Shoulder)*\n\n"
+        "**Phase 2** – Fracture detection *(ResNet50)*\n"
+        "*(Fractured / Normal)*"
     )
     st.markdown("---")
     st.caption("Supported formats: JPEG · PNG · WEBP")
@@ -247,9 +256,10 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="top-banner">
-  <h1 style="margin:0; font-size:2rem;">🦴 X-Ray Fracture Detection</h1>
-  <p style="color:#8888aa; margin:6px 0 0;">
-    Upload an X-ray image — the AI pipeline will identify the bone and check for fractures.
+  <h1 style="margin:0;font-size:2rem;">🦴 X-Ray Fracture Detection</h1>
+  <p style="color:#8888aa;margin:6px 0 0;">
+    Upload an X-ray image — the pipeline verifies authenticity,
+    identifies the bone, and checks for fractures.
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -260,6 +270,9 @@ uploaded_file = st.file_uploader(
     label_visibility="visible",
 )
 
+# ─────────────────────────────────────────────────────────────────
+# Results layout
+# ─────────────────────────────────────────────────────────────────
 if uploaded_file is not None:
     image_bytes = uploaded_file.read()
     pil_image   = Image.open(io.BytesIO(image_bytes))
@@ -269,7 +282,7 @@ if uploaded_file is not None:
 
     with col_img:
         st.markdown("#### Uploaded X-Ray")
-        st.image(pil_image, width=True, caption=uploaded_file.name)
+        st.image(pil_image, use_container_width=True, caption=uploaded_file.name)
 
     with col_results:
         if not api_ok:
@@ -280,13 +293,53 @@ if uploaded_file is not None:
             try:
                 result = call_predict_api(image_bytes, uploaded_file.name)
             except requests.exceptions.HTTPError as e:
-                st.error(f"API returned an error: {e.response.text}")
+                try:
+                    err    = e.response.json()
+                    detail = err.get("detail", {})
+                    if isinstance(detail, dict) and detail.get("error") == "AI-generated image detected":
+                        st.error("🚫 AI-generated image detected — upload blocked.")
+                        ca, cb = st.columns(2)
+                        ca.metric("AI Confidence", f"{detail.get('confidence', 0)*100:.1f}%")
+                        cb.markdown(
+                            f"<div class='result-card' style='margin-top:8px;'>"
+                            f"<span style='color:#8888aa;font-size:0.85rem;'>Reason</span><br>"
+                            f"<span>{detail.get('reason', '—')}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.error(f"API error: {detail or err}")
+                except Exception:
+                    st.error(f"API returned an error: {e.response.text}")
                 st.stop()
             except Exception as e:
                 st.error(f"Request failed: {e}")
                 st.stop()
 
-        # ── Phase 1 result ─────────────────────────────────────────
+        # ── Phase 0 card ──────────────────────────────────────────
+        st.markdown("#### 🧠 Phase 0 — Image Authenticity")
+        ai_flag   = result.get("is_ai_generated", False)
+        ai_conf   = result.get("ai_confidence", 0.0)
+        ai_reason = result.get("ai_reason", "")
+        ai_color  = "#ff4b4b" if ai_flag else "#00c853"
+        ai_badge  = "🚫 AI Generated" if ai_flag else "✅ Real Image"
+
+        if ai_flag:
+            st.warning("⚠ This image may be AI-generated. Results may be unreliable.")
+
+        reason_html = (
+            f"<div style='color:#aaa;font-size:0.82rem;margin-top:6px;'>{ai_reason}</div>"
+            if ai_reason else ""
+        )
+        st.markdown(f"""
+        <div class="result-card">
+          <div style="font-size:1.15rem;font-weight:700;color:{ai_color};">{ai_badge}</div>
+          <div style="color:#8888aa;font-size:0.85rem;margin-top:8px;">
+            Confidence: <strong style="color:#7eb6ff;">{ai_conf*100:.1f}%</strong>
+          </div>
+          {reason_html}
+        </div>""", unsafe_allow_html=True)
+
+        # ── Phase 1 card ──────────────────────────────────────────
         st.markdown("#### Phase 1 — Body Part")
         part_icon = PART_ICONS.get(result["predicted_part"], "🦴")
         st.markdown(f"""
@@ -303,12 +356,6 @@ if uploaded_file is not None:
         </div>
         """, unsafe_allow_html=True)
 
-        st.plotly_chart(
-            bar_chart_parts(result["part_probabilities"], result["predicted_part"]),
-            width=True,
-            config={"displayModeBar": False},
-        )
-
         # ── Phase 2 result ─────────────────────────────────────────
         st.markdown("#### Phase 2 — Fracture Detection")
         badge_class = "badge-fractured" if result["is_fractured"] else "badge-normal"
@@ -323,52 +370,87 @@ if uploaded_file is not None:
         </div>
         """, unsafe_allow_html=True)
 
-        # Gauges
-        g_col1, g_col2 = st.columns(2)
-        with g_col1:
-            st.plotly_chart(
-                gauge_chart(result["part_confidence"], "Part Confidence", "#7eb6ff"),
-                width=True,
-                config={"displayModeBar": False},
-            )
-        with g_col2:
-            frac_color = "#ff4b4b" if result["is_fractured"] else "#00c853"
-            st.plotly_chart(
-                gauge_chart(result["fracture_confidence"], "Fracture Probability", frac_color),
-                width=True,
-                config={"displayModeBar": False},
-            )
+    # ── Charts row — full width, 3 equal columns ──────────────────
+    st.markdown("---")
+    st.markdown("#### Confidence Charts")
+
+    ch1, ch2, ch3 = st.columns(3, gap="medium")
+
+    with ch1:
+        st.markdown(
+            "<p style='text-align:center;color:#8888aa;font-size:0.82rem;"
+            "text-transform:uppercase;letter-spacing:0.8px;margin-bottom:0;'>"
+            "AI Detection</p>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            gauge_chart(ai_conf, "AI Confidence", ai_color),
+            use_container_width=True,
+            config=PLOTLY_CFG,
+        )
+
+    with ch2:
+        st.markdown(
+            "<p style='text-align:center;color:#8888aa;font-size:0.82rem;"
+            "text-transform:uppercase;letter-spacing:0.8px;margin-bottom:0;'>"
+            "Part Identification</p>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            gauge_chart(result["part_confidence"], "Part Confidence", "#7eb6ff"),
+            use_container_width=True,
+            config=PLOTLY_CFG,
+        )
+
+    with ch3:
+        st.markdown(
+            "<p style='text-align:center;color:#8888aa;font-size:0.82rem;"
+            "text-transform:uppercase;letter-spacing:0.8px;margin-bottom:0;'>"
+            "Fracture Probability</p>",
+            unsafe_allow_html=True,
+        )
+        frac_color = "#ff4b4b" if result["is_fractured"] else "#00c853"
+        st.plotly_chart(
+            gauge_chart(result["fracture_confidence"], "Fracture Probability", frac_color),
+            use_container_width=True,
+            config=PLOTLY_CFG,
+        )
+
+    # ── Body-part probability bar chart ───────────────────────────
+    st.markdown("#### Body Part Probabilities")
+    st.plotly_chart(
+        bar_chart_parts(result["part_probabilities"], result["predicted_part"]),
+        use_container_width=True,
+        config=PLOTLY_CFG,
+    )
 
     # ── Summary metrics strip ──────────────────────────────────────
     st.markdown("---")
     st.markdown("#### Summary")
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.markdown(f"""
-        <div class="metric-tile">
-          <div class="value">{result["predicted_part"]}</div>
-          <div class="label">Detected Part</div>
-        </div>""", unsafe_allow_html=True)
-    with m2:
-        st.markdown(f"""
-        <div class="metric-tile">
-          <div class="value">{result["part_confidence"]*100:.0f}%</div>
-          <div class="label">Part Confidence</div>
-        </div>""", unsafe_allow_html=True)
-    with m3:
-        status_val = "⚠ Yes" if result["is_fractured"] else "✓ No"
-        status_color = "#ff4b4b" if result["is_fractured"] else "#00c853"
-        st.markdown(f"""
-        <div class="metric-tile">
-          <div class="value" style="color:{status_color};">{status_val}</div>
-          <div class="label">Fracture Present</div>
-        </div>""", unsafe_allow_html=True)
-    with m4:
-        st.markdown(f"""
-        <div class="metric-tile">
-          <div class="value">{result["fracture_confidence"]*100:.0f}%</div>
-          <div class="label">Fracture Probability</div>
-        </div>""", unsafe_allow_html=True)
+    m1, m2, m3, m4, m5 = st.columns(5)
+
+    tiles = [
+        (m1, result["predicted_part"],
+             "Detected Part", "#7eb6ff"),
+        (m2, f"{result['part_confidence']*100:.0f}%",
+             "Part Confidence", "#7eb6ff"),
+        (m3, "⚠ Yes" if result["is_fractured"] else "✓ No",
+             "Fracture Present",
+             "#ff4b4b" if result["is_fractured"] else "#00c853"),
+        (m4, f"{result['fracture_confidence']*100:.0f}%",
+             "Fracture Prob.", "#7eb6ff"),
+        (m5, "AI" if result.get("is_ai_generated") else "Real",
+             "Image Type",
+             "#ff4b4b" if result.get("is_ai_generated") else "#00c853"),
+    ]
+
+    for col, val, lbl, clr in tiles:
+        with col:
+            st.markdown(f"""
+            <div class="metric-tile">
+              <div class="value" style="color:{clr};">{val}</div>
+              <div class="label">{lbl}</div>
+            </div>""", unsafe_allow_html=True)
 
     # ── Raw JSON toggle ────────────────────────────────────────────
     with st.expander("🔍 Raw API response"):
