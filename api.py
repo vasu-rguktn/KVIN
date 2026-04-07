@@ -21,6 +21,12 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from  google import genai
+from google.genai import types
+import json
+import re
+from dotenv import load_dotenv
+
 # ─────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────
@@ -44,6 +50,19 @@ BODY_PART_CLASSES = ["Elbow", "Hand", "Shoulder"]
 
 IMG_SIZE = 224
 FRACTURE_THRESHOLD = 0.5
+AI_THRESHOLD = 0.7  # confidence threshold for AI detection
+
+
+load_dotenv()
+# Gemini setup
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+client = None
+
+if not GOOGLE_API_KEY:
+    log.warning("⚠ GOOGLE_API_KEY not set — AI detection disabled")
+else:
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    log.info("✓ Gemini Client initialized")
 
 # ─────────────────────────────────────────────────────────────────
 # Global model registry  (loaded once at startup via lifespan)
@@ -105,6 +124,11 @@ class PredictionResponse(BaseModel):
     # Convenience flag
     is_fractured: bool
 
+    # AI detection
+    is_ai_generated: bool
+    ai_confidence: float
+    ai_reason: Optional[str]
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -120,6 +144,88 @@ def preprocess_bytes(image_bytes: bytes) -> np.ndarray:
     tensor = tf.image.resize(tensor, (IMG_SIZE, IMG_SIZE))
     tensor = tf.keras.applications.resnet50.preprocess_input(tensor)
     return tensor.numpy()
+
+# ─────────────────────────────────────────────────────────────────
+# AI Detection (Gemini)
+# ─────────────────────────────────────────────────────────────────
+def detect_ai_generated(image_bytes: bytes) -> dict:
+    
+    if client is None:
+        return {
+            "is_ai_generated": False,
+            "confidence": 0.0,
+            "reason": "Gemini not configured"
+        }
+    
+    try:
+        prompt = """
+            You are an expert forensic AI system specializing in detecting AI-generated images, 
+            with deep knowledge of image forensics, generative models, and visual artifacts. 
+            Your role is to act as a highly skilled digital forensic analyst. 
+            You must provide accurate and confident assessments of whether an image was AI-generated or authentic.
+
+            Persona and Role:
+            - You are a meticulous forensic investigator.
+            - You cannot make assumptions without evidence from the image.
+            - You always quantify your confidence as a float between 0.0 and 1.0.
+            - You provide concise reasoning for your decision, highlighting visual cues, patterns, or artifacts.
+
+            Process:
+            1. Examine the image thoroughly for AI-specific artifacts such as:
+            - unnatural textures
+            - inconsistencies in lighting or anatomy
+            - unusual backgrounds or details
+            - generative model fingerprints (e.g., diffusion artifacts)
+            2. Determine whether the image is AI-generated or authentic.
+            3. Quantify your confidence in the detection (0 = completely unsure, 1 = completely certain).
+            4. Provide a brief, clear explanation in the 'reason' field summarizing the key cues leading to your conclusion.
+            5. Respond STRICTLY in JSON format ONLY. Do NOT include any commentary, greetings, or extra text outside the JSON.
+
+            Required JSON format:
+            {
+                "is_ai_generated": true or false,        // boolean: true if AI-generated, false if authentic
+                "confidence": 0.0 to 1.0,                // float: probability score of your assessment
+                "reason": "short explanation"            // string: concise forensic reasoning
+            }
+
+            Additional Instructions:
+            - JSON must be parseable by a standard JSON parser.
+            - Use only boolean true/false, not strings like "True" or "False".
+            - Keep 'reason' short, ideally 20-40 words max.
+            - Focus on forensic evidence visible in the image.
+        """
+
+        for attempt in range(1):  # simple retry in case of transient errors
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[
+                        prompt,
+                        types.Part.from_bytes(
+                            data=image_bytes,
+                            mime_type="image/jpeg"
+                        )
+                    ]
+                )
+                text = response.text.strip()
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                if match:
+                    result = json.loads(match.group(0))
+                    return {
+                        "is_ai_generated": bool(result.get("is_ai_generated", False)),
+                        "confidence": float(result.get("confidence", 0.0)),
+                        "reason": result.get("reason", "").strip()
+                    }
+            except Exception as e:
+                log.warning(f"Gemini attempt {attempt+1} failed: {e}")
+
+    except Exception as e:
+        log.exception("Gemini detection failed")
+        return {
+            "is_ai_generated": False,
+            "confidence": 0.0,
+            "reason": "AI detection unavailable",
+        }
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -176,6 +282,33 @@ async def predict(file: UploadFile = File(..., description="X-ray image (JPEG / 
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty file received.")
+    if len(image_bytes) > 10_000_000:  # 10 MB limit
+        raise HTTPException(status_code=413, detail="File too large")
+    
+    # ── AI detection (NEW STEP) ─────────────────────────────
+    ai_result = detect_ai_generated(image_bytes) or {
+        "is_ai_generated": False,
+        "confidence": 0.0,
+        "reason": "AI detection unavailable"
+    }
+
+    log.info(
+        f"[{file.filename}] AI detection → "
+        f"is_ai={ai_result['is_ai_generated']} "
+        f"conf={ai_result['confidence']:.3f}"
+        f"reason={ai_result['reason']}"
+    )
+
+    # Strict blocking (only if high confidence)
+    if ai_result["is_ai_generated"] and ai_result["confidence"] >= AI_THRESHOLD:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "AI-generated image detected",
+                "confidence": ai_result["confidence"],
+                "reason": ai_result["reason"],
+            },
+        )
 
     # ── preprocess ────────────────────────────────────────────────
     try:
@@ -213,4 +346,7 @@ async def predict(file: UploadFile = File(..., description="X-ray image (JPEG / 
         fracture_confidence  = round(frac_conf, 4),
         fracture_label       = "⚠ Fracture Detected" if pred_frac == "fractured" else "✓ No Fracture",
         is_fractured         = pred_frac == "fractured",
+        is_ai_generated      = ai_result["is_ai_generated"],
+        ai_confidence        = round(ai_result["confidence"], 4),
+        ai_reason            = ai_result.get("reason"),
     )
