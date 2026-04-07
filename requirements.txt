@@ -4,3 +4,14 @@ matplotlib
 tensorflow
 scikit-learn
 seaborn
+ 
+# API backend
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9   # required for FastAPI file uploads
+ 
+# Streamlit frontend
+streamlit>=1.35.0
+plotly>=5.20.0
+Pillow>=10.0.0
+requests>=2.31.0
