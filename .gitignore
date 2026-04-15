@@ -4,3 +4,4 @@ cache*
 .vscode
 weights/
 __pycache__/
+.env*
